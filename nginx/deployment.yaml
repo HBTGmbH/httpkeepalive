@@ -1,0 +1,210 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      volumes:
+      - name: config
+        configMap:
+          name: nginx
+      - name: nginx-tmp
+        emptyDir: {}
+      containers:
+      - name: nginx
+        image: nginxinc/nginx-unprivileged:1.29.5-alpine3.23
+        args:
+        - /docker-entrypoint.sh
+        - nginx
+        - -g
+        - daemon off;
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/conf.d
+          readOnly: true
+        - name: nginx-tmp
+          mountPath: /tmp
+        lifecycle:
+          preStop:
+            sleep:
+              # Sleep for 15 seconds to allow any kube-proxy or ingress gateway
+              # client to stop initiating new connections. After that, nginx
+              # will start graceful shutdown by stopping to accept new connections
+              # and waiting for existing requests to finish, as well as responding
+              # with 'Connection: close' for still incoming  requests on keep-alive
+              # connections for keepalive_min_timeout.
+              seconds: 15
+        startupProbe:
+          successThreshold: 1
+          failureThreshold: 30
+          periodSeconds: 1
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: 8080
+        readinessProbe:
+          successThreshold: 1
+          failureThreshold: 2
+          periodSeconds: 3
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: 8080
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          privileged: false
+          capabilities:
+            drop:
+              - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+        ports:
+        - name: http
+          containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nginx
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: nginx
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: nginx
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx
+data:
+  default.conf: |
+    # file: default.conf
+    upstream envoy {
+      server    envoy;
+      keepalive 100;
+      keepalive_timeout  4s; # <- must always be lower than the server's keep-alive timeout
+      keepalive_requests 600000; # <- take longer to close connections due to having seen enough requests
+      keepalive_time     1h;
+    }
+    upstream envoy_tcp {
+      server    envoy:90;
+      keepalive 100;
+      keepalive_timeout  4s; # <- must always be lower than the server's keep-alive timeout
+      keepalive_requests 600000; # <- take longer to close connections due to having seen enough requests
+      keepalive_time     1h;
+    }
+    upstream varnish {
+      server    varnish;
+      keepalive 100;
+      keepalive_timeout  4s; # <- must always be lower than the server's keep-alive timeout
+      keepalive_requests 600000; # <- take longer to close connections due to having seen enough requests
+      keepalive_time     1h;
+    }
+    upstream java-demo {
+      server    java-demo;
+      keepalive 100;
+      keepalive_timeout  4s; # <- must always be lower than the server's keep-alive timeout
+      keepalive_requests 600000; # <- take longer to close connections due to having seen enough requests
+      keepalive_time     1h;
+    }
+    upstream go-demo {
+      server    go-demo;
+      keepalive 100;
+      keepalive_timeout  4s; # <- must always be lower than the server's keep-alive timeout
+      keepalive_requests 600000; # <- take longer to close connections due to having seen enough requests
+      keepalive_time     1h;
+    }
+    upstream node-demo {
+      server    node-demo;
+      keepalive 100;
+      keepalive_timeout  4s; # <- must always be lower than the server's keep-alive timeout
+      keepalive_requests 600000; # <- take longer to close connections due to having seen enough requests
+      keepalive_time     1h;
+    }
+    server {
+      http2                 on;
+      listen                8080;
+      keepalive_requests    600000; # <- take longer to close connections due to having seen enough requests
+      keepalive_time        1h;
+      keepalive_timeout     60s; # <- must always be higher than any clients' keep-alive timeouts
+      keepalive_min_timeout 5s;  # <- avoid closing idle connections during graceful shutdown for 5s (expected max client-side keep-alive timeout)
+      location /ready {
+          return 200;
+      }
+      location ^~ /envoy/ {
+        proxy_pass http://envoy/;
+        proxy_http_version 1.1;
+        proxy_set_header   "Connection" "";
+      }
+      location ^~ /envoy-tcp/ {
+        proxy_pass http://envoy_tcp/;
+        proxy_http_version 1.1;
+        proxy_set_header   "Connection" "";
+      }
+      location ^~ /varnish/ {
+        proxy_pass http://varnish/;
+        proxy_http_version 1.1;
+        proxy_set_header   "Connection" "";
+      }
+      location ^~ /java-demo/ {
+        proxy_pass http://java-demo/;
+        proxy_http_version 1.1;
+        proxy_set_header   "Connection" "";
+      }
+      location ^~ /go-demo/ {
+        proxy_pass http://go-demo/;
+        proxy_http_version 1.1;
+        proxy_set_header   "Connection" "";
+      }
+      location ^~ /node-demo/ {
+        proxy_pass http://node-demo/;
+        proxy_http_version 1.1;
+        proxy_set_header   "Connection" "";
+      }
+    }

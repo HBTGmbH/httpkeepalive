@@ -1,0 +1,371 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: varnish
+type: Opaque
+stringData:
+  secret: "whatever"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: varnish
+  labels:
+    app: varnish
+spec:
+  replicas: 2
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app: varnish
+  template:
+    metadata:
+      labels:
+        app: varnish
+    spec:
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - name: config
+        configMap:
+          name: varnish
+      - name: secret
+        secret:
+          secretName: varnish
+      - name: tmp
+        emptyDir:
+          medium: Memory
+#      initContainers:
+#      - name: yap
+#        image: ${IMAGE_REPO_PREFIX}/yap:1.0.0
+#        imagePullPolicy: Always
+#        args:
+#        - --listen=0.0.0.0:8080
+#        - --upstream=http://127.0.0.1:8081
+#        - --threads=2
+#        - --hash-filter=/echo
+#        lifecycle:
+#          preStop:
+#            sleep:
+#              # Sleep for 15 seconds to allow any kube-proxy or ingress gateway
+#              # client to stop initiating new connections. After that, the custom
+#              # Node.js application will either start draining connections by responding
+#              # with 'Connection: close' (if ENABLE_DRAIN is 'true') or just terminate
+#              # existing connections abruptly (if ENABLE_DRAIN is 'false').
+#              seconds: 15
+#        resources:
+#          requests:
+#            cpu: 10m
+#            memory: 16Mi
+#        securityContext:
+#          allowPrivilegeEscalation: false
+#          readOnlyRootFilesystem: true
+#          privileged: false
+#          capabilities:
+#            drop:
+#              - ALL
+#          runAsNonRoot: true
+#          runAsUser: 1000
+#        restartPolicy: Always
+#        startupProbe:
+#          successThreshold: 1
+#          failureThreshold: 30
+#          periodSeconds: 1
+#          timeoutSeconds: 1
+#          httpGet:
+#            path: /health
+#            port: http
+#        readinessProbe:
+#          successThreshold: 1
+#          failureThreshold: 2
+#          periodSeconds: 3
+#          timeoutSeconds: 1
+#          httpGet:
+#            path: /health
+#            port: http
+#        ports:
+#        - name: http
+#          containerPort: 8080
+      containers:
+      - name: varnishd
+        image: varnish:7.7.3-alpine
+        args:
+        - -F
+        - -f
+        - /etc/varnish/default.vcl
+        - -a
+        - http=:8080,HTTP
+        - -T
+        - 127.0.0.1:6082
+        - -S
+        - /var/lib/varnish/secrets/secret
+        - -s
+        - default,1M
+        - -n
+        - /tmp/varnish_workdir
+        - -t
+        - 5s
+        - -p
+        - feature=none,+validate_headers,+vcl_req_reset,+http2
+        - -p
+        - default_grace=0s
+        - -p
+        - default_keep=0s
+        - -p
+        - timeout_idle=60s
+        - -p
+        - backend_idle_timeout=4s
+        volumeMounts:
+        - name: config
+          mountPath: /etc/varnish
+          readOnly: true
+        - name: secret
+          mountPath: /var/lib/varnish/secrets
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        env:
+        - name: LOOP_TIMEOUT
+          value: "15"
+        lifecycle:
+          preStop:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  # Mark the drain_flag backend as sick to trigger draining of existing connections
+                  # with the help of the VCL script which checks backend health on each vcl_deliver
+                  # invocation and adds 'Connection: close' to all responses if unhealthy.
+                  varnishadm -T 127.0.0.1:6082 -S /var/lib/varnish/secrets/secret backend.set_health drain_flag sick
+                  # Wait 15 seconds for new connections to stop coming in due to kube-proxy
+                  # updating netfilter rules in all clients' nodes. This usually will take at least 5s.
+                  # https://learnkube.com/graceful-shutdown mentions that 15s is a safe duration.
+                  # If clients do not route via kube-proxy/netfilter but enumerate pod IPs via DNS
+                  # then with kube-dns it can take as long as 30s for clients to get an updated pods
+                  # list after the pod enters the 'Terminating' phase.
+                  # But we will assume that there are only kube-proxy/netfilter-based clients that
+                  # connect to the Service IPs.
+                  echo > /proc/1/fd/1 "preStop: Waiting 15s for new connections to stop coming in..."
+                  sleep 15
+                  if [ "$LOOP_TIMEOUT" -gt 0 ]; then
+                    deadline=$(( $(date +%s) + LOOP_TIMEOUT ))
+                  fi
+                  echo > /proc/1/fd/1 "preStop: Waiting at most ${LOOP_TIMEOUT}s for all connections to be drained..."
+                  while :; do
+                    # Query the number of active client connections with varnishstat
+                    val=$(varnishstat -n /tmp/varnish_workdir -1 \
+                          | awk '/MEMPOOL\.sess[0-9]+\.live/ {a+=$2} END {print a+0}')
+                    if [ "$val" -eq 0 ]; then
+                      echo > /proc/1/fd/1 "preStop: All connections are gone. Telling Varnish to shut down now."
+                      break
+                    elif [ "${LOOP_TIMEOUT:-0}" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
+                      echo > /proc/1/fd/1 "preStop: Deadline reached while there are still connections. Telling Varnish to shut down now anyway."
+                      break
+                    fi
+                    echo > /proc/1/fd/1 "preStop: There are still $val client connections. Continue waiting..."
+                    sleep 1
+                  done
+        startupProbe:
+          successThreshold: 1
+          failureThreshold: 30
+          periodSeconds: 1
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: http
+        readinessProbe:
+          successThreshold: 1
+          failureThreshold: 2
+          periodSeconds: 3
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          privileged: false
+          capabilities:
+            drop:
+              - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+        ports:
+        - name: http
+          containerPort: 8080
+      - name: log
+        image: varnish:7.7.3-alpine
+        command:
+        - varnishlog
+        args:
+        - -n
+        - /tmp/varnish_workdir
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        lifecycle:
+          preStop:
+            sleep:
+              seconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: varnish
+spec:
+  selector:
+    app: varnish
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: varnish
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: varnish
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: varnish
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: varnish
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: varnish
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: varnish
+data:
+  default.vcl: |
+    # specify the VCL syntax version to use
+    vcl 4.1;
+    import std;
+    import bodyaccess;
+    
+    # Dummy backend to use as a drain flag. The preStop hook will set this backend to sick to trigger draining
+    # via varnishadm and wait 15s before letting the kubelet send SIGTERM to the container.
+    backend drain_flag {
+      .host = "127.0.0.1";
+      .port = "9";
+    }
+    
+    backend envoy {
+      .host = "envoy";
+      .port = "80";
+    }
+    backend nginx {
+      .host = "nginx";
+      .port = "80";
+    }
+    backend java-demo {
+      .host = "java-demo";
+      .port = "80";
+    }
+    backend go-demo {
+      .host = "go-demo";
+      .port = "80";
+    }
+    backend node-demo {
+      .host = "node-demo";
+      .port = "80";
+    }
+    
+    sub vcl_synth {
+      set resp.http.Content-Type = "text/plain";
+      set resp.body = "";
+      return (deliver);
+    }
+    sub handle_draining {
+      # During draining, which is activated via varnishadm setting the backend health to sick,
+      # we respond with 'Connection: close' to inform clients not to reuse connections.
+      # This will eventually lead to all connections being closed and no new requests being accepted.
+      if (!std.healthy(drain_flag)) {
+        set resp.http.Connection = "close";
+      }
+    }
+    sub handle_readiness {
+      if (req.url == "/ready") {
+        # Return 200 if not draining, else 503.
+        if (std.healthy(drain_flag)) {
+          return (synth(200));
+        } else {
+          return (synth(503));
+        }
+      }
+    }
+    sub cache_req_body {
+      unset req.http.X-Post-Body-Len;
+      unset req.http.X-Original-Method;
+      if (std.cache_req_body(1MB)) {
+        set req.http.X-Original-Method = req.method;
+        set req.http.X-Post-Body-Len = bodyaccess.len_req_body();
+      } else {
+        return (synth(413));
+      }
+    }
+    sub vcl_hash {
+      hash_data(req.http.Content-Type);
+      if (req.http.X-Post-Body-Len) {
+        bodyaccess.hash_req_body();
+      }
+    }
+    sub vcl_recv {
+      set req.http.Host = regsub(req.http.Host, "\.$", "");
+      call handle_readiness;
+      call cache_req_body;
+    
+      if (req.url ~ "^/envoy/") {
+        set req.url = regsub(req.url, "^/envoy/", "/");
+        set req.backend_hint = envoy;
+      } else if (req.url ~ "^/nginx/") {
+        set req.url = regsub(req.url, "^/nginx/", "/");
+        set req.backend_hint = nginx;
+      } else if (req.url ~ "^/java-demo/") {
+        set req.url = regsub(req.url, "^/java-demo/", "/");
+        set req.backend_hint = java-demo;
+      } else if (req.url ~ "^/go-demo/") {
+        set req.url = regsub(req.url, "^/go-demo/", "/");
+        set req.backend_hint = go-demo;
+      } else if (req.url ~ "^/node-demo/") {
+        set req.url = regsub(req.url, "^/node-demo/", "/");
+        set req.backend_hint = node-demo;
+      } else {
+        return (synth(404));
+      }
+    }
+    sub fetch_for_post {
+      if (bereq.http.X-Original-Method) {
+        set bereq.method = bereq.http.X-Original-Method;
+      }
+    }
+    sub vcl_backend_fetch {
+      unset bereq.http.Cache-Status;
+      unset bereq.http.X-Cache;
+      call fetch_for_post;
+    }
+    sub vcl_deliver {
+      # Check whether we are draining and adjust the Connection header in client responses accordingly.
+      call handle_draining;
+    }
+

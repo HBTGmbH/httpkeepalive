@@ -1,0 +1,18 @@
+apiVersion: gateway.nginx.org/v1alpha1
+kind: SnippetsPolicy
+metadata:
+  name: keepalive-min-timeout
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: nginx
+  snippets:
+    # Set keepalive_min_timeout to gracefully drain
+    # idle connections on Nginx gateway shutdown.
+    # Without this property, Nginx would close connections
+    # as soon as they become idle, which might be in-between
+    # two client requests.
+    - context: http
+      value: keepalive_min_timeout 15s;
+

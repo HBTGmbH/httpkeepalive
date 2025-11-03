@@ -1,0 +1,22 @@
+FROM eclipse-temurin:25.0.2_10-jdk-alpine-3.23 AS builder
+WORKDIR /build
+ADD build/libs/java-demo-0.0.1-SNAPSHOT.jar app.jar
+RUN unzip -qq app.jar -d extracted \
+ && jdeps --ignore-missing-deps \
+          --recursive \
+          --multi-release 25 \
+          --print-module-deps \
+          --class-path 'extracted/BOOT-INF/lib/*' \
+          app.jar > deps \
+ && jlink --add-modules "$(cat deps)" \
+          --strip-debug \
+          --no-header-files \
+          --no-man-pages \
+          --output jre \
+ && rm -rf extracted
+
+FROM alpine:3.23.3
+USER 1001:1001
+COPY --chown=1001:1001 --from=builder /build /
+CMD ["/jre/bin/java", "-jar", "app.jar"]
+

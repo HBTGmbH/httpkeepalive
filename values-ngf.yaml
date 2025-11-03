@@ -1,0 +1,28 @@
+nginxGateway:
+  snippets:
+    enable: true
+  lifecycle:
+    preStop:
+      exec:
+        command:
+        - /usr/bin/gateway
+        - sleep
+        - --duration=30s
+nginx:
+  pod:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/instance: ngf
+                app.kubernetes.io/name: nginx-nginx
+            topologyKey: kubernetes.io/hostname
+  container:
+    lifecycle:
+      preStop:
+        exec:
+          command:
+          - /bin/sleep
+          - "30"
+
