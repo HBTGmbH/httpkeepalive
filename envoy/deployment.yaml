@@ -1,0 +1,551 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy
+  labels:
+    app: envoy
+spec:
+  replicas: 2
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app: envoy
+  template:
+    metadata:
+      labels:
+        app: envoy
+    spec:
+      volumes:
+      - name: config
+        configMap:
+          name: envoy
+      containers:
+      - name: helper
+        image: alpine:3.23.2
+        restartPolicy: Never
+        command:
+        # The following command installs a signal/trap handler for SIGTERM
+        # that will first sleep for 10s in order to allow clients to stop making
+        # new connections. After that, it will send a drain signal to Envoy
+        # which will then drain existing connections for 10s.
+        - /bin/sh
+        - -c
+        - >
+          trap 'echo "Waiting for 10s for new connections to stop coming in..." &&
+                sleep 10 &&
+                echo "Send /drain_listeners?graceful termination signal to Envoy..." &&
+                wget -q -O - --tries=1 --timeout=2 --post-data="" http://127.0.0.1:9901/drain_listeners?graceful >/dev/null 2>&1 ||
+                true; exit 0' TERM INT; 
+          while :; do sleep 5; done
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          privileged: false
+          capabilities:
+            drop:
+              - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+      - name: envoy
+        image: envoyproxy/envoy:distroless-v1.37.0
+        args:
+        - -c
+        - /config/config.yaml
+        - --drain-time-s
+        - '10'
+        - --drain-strategy
+        - gradual
+        volumeMounts:
+        - name: config
+          mountPath: "/config"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          privileged: false
+          capabilities:
+            drop:
+              - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+        lifecycle:
+          preStop:
+            sleep:
+              # Sleep for 20 seconds:
+              # - 10s before the helper container sends drain signal
+              # - 10s for the drain to finalize
+              seconds: 20
+        startupProbe:
+          successThreshold: 1
+          failureThreshold: 30
+          periodSeconds: 1
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: 9901
+        readinessProbe:
+          successThreshold: 1
+          failureThreshold: 2
+          periodSeconds: 3
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: 9901
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: "1"
+            memory: 128Mi
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: tcp
+          containerPort: 8443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy
+spec:
+  selector:
+    app: envoy
+  ports:
+  - name: http
+    protocol: TCP
+    port: 80
+    targetPort: http
+  - name: tcp
+    protocol: TCP
+    port: 90
+    targetPort: tcp
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: envoy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: envoy
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: envoy
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: envoy
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: envoy
+            port:
+              number: 80
+  - host: envoy-tcp
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: envoy
+            port:
+              number: 90
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy
+data:
+  config.yaml: |
+    # file: config.yaml
+    admin:
+      profile_path: /tmp/envoy.prof
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 9901 }
+    overload_manager:
+      refresh_interval:
+        seconds: 0
+        nanos: 250000000 # <- 250ms
+      resource_monitors:
+        - name: "envoy.resource_monitors.fixed_heap"
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.resource_monitors.fixed_heap.v3.FixedHeapConfig
+            max_heap_size_bytes: 134217728  # <- 128MiB
+        - name: "envoy.resource_monitors.global_downstream_max_connections"
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+            max_active_downstream_connections: 10000
+      actions:
+        - name: "envoy.overload_actions.disable_http_keepalive"
+          triggers:
+            - name: "envoy.resource_monitors.fixed_heap"
+              threshold:
+                value: 0.92
+        - name: "envoy.overload_actions.stop_accepting_requests"
+          triggers:
+            - name: "envoy.resource_monitors.fixed_heap"
+              threshold:
+                value: 0.95
+      loadshed_points:
+        - name: "envoy.load_shed_points.tcp_listener_accept"
+          triggers:
+            - name: "envoy.resource_monitors.fixed_heap"
+              threshold:
+                value: 0.95
+    static_resources:
+      listeners:
+      - name: tcp
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8443
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.tcp_proxy
+            typed_config:
+              '@type': type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+              access_log:
+              - name: envoy.access_loggers.stdout
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+              cluster: go_demo_80_h1
+              idle_timeout: 4s
+              stat_prefix: tcp
+      - name: http
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8080
+        per_connection_buffer_limit_bytes: 32768  # <- 32 KiB
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: http
+              drain_timeout: 5s
+              delayed_close_timeout: 1s
+              common_http_protocol_options:
+                idle_timeout: 60s
+              http2_protocol_options:
+                max_concurrent_streams: 100
+                initial_stream_window_size: 65536  # <- 64 KiB
+                initial_connection_window_size: 1048576  # <- 1 MiB
+              access_log:
+              - name: envoy.access_loggers.stdout
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+              http_filters:
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+              route_config:
+                name: local_route
+                virtual_hosts:
+                - name: java_demo
+                  domains: ["*"]
+                  #retry_policy:
+                  #  retry_on: refused-stream
+                  #  num_retries: 3
+                  routes:
+                  - match:
+                      prefix: "/java-demo/"
+                      query_parameters:
+                      - name: h2
+                        present_match: true
+                      - name: dns
+                        present_match: true
+                    route:
+                      cluster: java_demo_80_h2_dns
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/java-demo/"
+                      query_parameters:
+                      - name: h2
+                        present_match: true
+                    route:
+                      cluster: java_demo_80_h2
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/java-demo/"
+                    route:
+                      cluster: java_demo_80_h1
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/nginx/"
+                      query_parameters:
+                      - name: h2
+                        present_match: true
+                    route:
+                      cluster: nginx_80_h2
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/nginx/"
+                    route:
+                      cluster: nginx_80_h1
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/varnish/"
+                      query_parameters:
+                      - name: h2
+                        present_match: true
+                    route:
+                      cluster: varnish_80_h2
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/varnish/"
+                    route:
+                      cluster: varnish_80_h1
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/node-demo/"
+                    route:
+                      cluster: node_demo_80_h1
+                      prefix_rewrite: "/"
+                  - match:
+                      prefix: "/go-demo/"
+                    route:
+                      cluster: go_demo_80_h1
+                      prefix_rewrite: "/"
+      clusters:
+      - name: nginx_80_h1
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http_protocol_options: {}
+        load_assignment:
+          cluster_name: nginx_80_h1
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: nginx
+                    port_value: 80
+      - name: nginx_80_h2
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http2_protocol_options:
+                max_concurrent_streams: 100
+                initial_stream_window_size: 65536  # 64 <- KiB
+                initial_connection_window_size: 1048576  # <- 1 MiB
+        load_assignment:
+          cluster_name: nginx_80_h2
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: nginx
+                    port_value: 80
+      - name: varnish_80_h1
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http_protocol_options: {}
+        load_assignment:
+          cluster_name: varnish_80_h1
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: varnish
+                    port_value: 80
+      - name: varnish_80_h2
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http2_protocol_options:
+                max_concurrent_streams: 100
+                initial_stream_window_size: 65536  # 64 <- KiB
+                initial_connection_window_size: 1048576  # <- 1 MiB
+        load_assignment:
+          cluster_name: varnish_80_h2
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: varnish
+                    port_value: 80
+      - name: java_demo_80_h1
+        #circuit_breakers:
+        #  thresholds:
+        #  - max_connections: 4294967295
+        #    max_pending_requests: 4294967295
+        #    max_requests: 4294967295
+        #    max_retries: 4294967295
+        #    track_remaining: true
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http_protocol_options: {}
+        load_assignment:
+          cluster_name: java_demo_80_h1
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: java-demo
+                    port_value: 80
+      - name: java_demo_80_h2
+        #circuit_breakers:
+        #  thresholds:
+        #  - max_connections: 4294967295
+        #    max_pending_requests: 4294967295
+        #    max_requests: 4294967295
+        #    max_retries: 4294967295
+        #    track_remaining: true
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http2_protocol_options:
+                max_concurrent_streams: 100
+                initial_stream_window_size: 65536  # 64 <- KiB
+                initial_connection_window_size: 1048576  # <- 1 MiB
+        load_assignment:
+          cluster_name: java_demo_80_h2
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: java-demo
+                    port_value: 80
+      - name: java_demo_80_h2_dns
+        #circuit_breakers:
+        #  thresholds:
+        #  - max_connections: 4294967295
+        #    max_pending_requests: 4294967295
+        #    max_requests: 4294967295
+        #    max_retries: 4294967295
+        #    track_remaining: true
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_refresh_rate: 3s
+            respect_dns_ttl: false
+            dns_jitter: 0.300s
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http2_protocol_options:
+                max_concurrent_streams: 100
+                initial_stream_window_size: 65536  # 64 <- KiB
+                initial_connection_window_size: 1048576  # <- 1 MiB
+        load_assignment:
+          cluster_name: java_demo_80_h2_dns
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: java-demo-headless
+                    port_value: 8080
+      - name: node_demo_80_h1
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http_protocol_options: {}
+        load_assignment:
+          cluster_name: node_demo_80_h1
+          endpoints:
+            - lb_endpoints:
+                - endpoint:
+                    address:
+                      socket_address:
+                        address: node-demo
+                        port_value: 80
+      - name: go_demo_80_h1
+        cluster_type:
+          name: envoy.clusters.dns_cluster
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+            dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            common_http_protocol_options:
+              idle_timeout: 4s
+            explicit_http_config:
+              http_protocol_options: {}
+        load_assignment:
+          cluster_name: go_demo_80_h1
+          endpoints:
+            - lb_endpoints:
+                - endpoint:
+                    address:
+                      socket_address:
+                        address: go-demo
+                        port_value: 80

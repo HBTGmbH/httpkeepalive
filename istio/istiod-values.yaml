@@ -1,0 +1,67 @@
+global:
+  variant: distroless # <- use smaller and safer distroless images!
+  logAsJson: true
+  logging:
+    level: "all:error"
+  defaultPodDisruptionBudget:
+    enabled: true
+  proxy:
+    clusterDomain: "test"
+    logLevel: error
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+replicaCount: 2
+autoscaleEnabled: false
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+sidecarInjectorWebhook:
+  enableNamespacesByDefault: false
+  injectedAnnotations:
+    sidecar.istio.io/statsCompression: gzip
+meshConfig:
+  meshId: test
+  trustDomain: test
+  enablePrometheusMerge: false
+  accessLogEncoding: JSON
+  accessLogFile: "/dev/stdout"
+  disableEnvoyListenerLog: false
+  enableTracing: true
+  extensionProviders:
+  - name: zipkin
+    zipkin:
+      service: zipkin.monitoring.svc.test
+      port: 9411
+  dnsRefreshRate: 300s
+  connectTimeout: 1s
+  defaultHttpRetryPolicy:
+    attempts: 2
+    retryOn: "reset-before-request,connect-failure,refused-stream"
+  defaultConfig:
+    tracing: {} # disable legacy MeshConfig tracing options
+    discoveryAddress: "istiod.istio-system.svc.test.:15012"
+    proxyMetadata:
+      CA_ADDR: "istiod.istio-system.svc.test.:15012"
+      ISTIO_META_DNS_CAPTURE: "true"
+      ISTIO_META_DNS_AUTO_ALLOCATE: "true"
+      EXIT_ON_ZERO_ACTIVE_CONNECTIONS: "true"
+      ENABLE_INBOUND_RETRY_POLICY: 'true'
+    proxyStatsMatcher:
+      inclusionPrefixes:
+        - listener
+        - cluster
+        - http
+    terminationDrainDuration: 15s
+pilot:
+  env:
+    ENABLE_NATIVE_SIDECARS: 'true'
+    ENABLE_INBOUND_RETRY_POLICY: 'true'
+  serviceAnnotations:
+    service.kubernetes.io/topology-mode: auto
+

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-demo
+  labels:
+    app: node-demo
+spec:
+  replicas: 2
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app: node-demo
+  template:
+    metadata:
+      labels:
+        app: node-demo
+    spec:
+      containers:
+      - name: node-demo
+        image: ${IMAGE_REPO_PREFIX}/node-demo:1.0.0
+        imagePullPolicy: Always
+        lifecycle:
+          preStop:
+            sleep:
+              # Sleep for 15 seconds to allow any kube-proxy or ingress gateway
+              # client to stop initiating new connections. After that, the custom
+              # Node.js application will either start draining connections by responding
+              # with 'Connection: close' (if ENABLE_DRAIN is 'true') or just terminate
+              # existing connections abruptly (if ENABLE_DRAIN is 'false').
+              seconds: 15
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          privileged: false
+          capabilities:
+            drop:
+              - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+        startupProbe:
+          successThreshold: 1
+          failureThreshold: 30
+          periodSeconds: 1
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: http
+        readinessProbe:
+          successThreshold: 1
+          failureThreshold: 2
+          periodSeconds: 3
+          timeoutSeconds: 1
+          httpGet:
+            path: /ready
+            port: http
+        env:
+        - name: ENABLE_DRAIN # <- remove this an you will get TCP RST errors
+          value: 'true'
+        ports:
+        - name: http
+          containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-demo
+spec:
+  selector:
+    app: node-demo
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: node-demo
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: node-demo
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: node-demo
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: node-demo
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: node-demo
+            port:
+              number: 80

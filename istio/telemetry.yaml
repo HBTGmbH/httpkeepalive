@@ -1,0 +1,37 @@
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: metrics
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      tracing: "true"
+  tracing:
+  - providers:
+    - name: zipkin
+    randomSamplingPercentage: 100
+  metrics:
+    - providers:
+        - name: prometheus
+      overrides:
+        - tagOverrides:
+            destination_address:
+              value: "string(destination.address)"
+            destination_port:
+              value: "string(destination.port)"
+            request_host:
+              value: "request.host"
+            loadtest:
+              value: "request.headers['x-loadtest']"
+            requested_server_name:
+              value: "connection.requested_server_name"
+            upstream_request_attempt_count:
+              value: "upstream.request_attempt_count"
+            x_envoy_attempt_count_req:
+              value: "request.headers['x-envoy-attempt-count']"
+            x_envoy_attempt_count_res:
+              value: "response.headers['x-envoy-attempt-count']"
+            x_envoy_is_timeout_retry:
+              value: "request.headers['x-envoy-is-timeout-retry']"
+
