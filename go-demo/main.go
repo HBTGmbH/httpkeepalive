@@ -1,0 +1,196 @@
+// file: main.go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+var shutdownInitiated = atomic.Bool{}
+var shutdownTimer atomic.Pointer[time.Timer]
+var gracefulShutdown = os.Getenv("GRACEFUL_SHUTDOWN") == "true"
+
+const clientSideIdleTimeout = 15 * time.Second
+
+func graceful(next http.Handler) http.Handler {
+	if !gracefulShutdown {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requestDuringShutdown() {
+			// Inform the client to close the connection after this request
+			// so that it does not attempt to reuse it.
+			w.Header().Set("Connection", "close")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requestDuringShutdown() bool {
+	if shutdownInitiated.Load() {
+		if timer := shutdownTimer.Load(); timer != nil {
+			_, _ = fmt.Printf("%v: resetting shutdown timer to wait %v again\n", time.Now().Format(time.RFC3339), clientSideIdleTimeout)
+			timer.Reset(clientSideIdleTimeout)
+		}
+		return true
+	}
+	return false
+}
+
+func sleep(w http.ResponseWriter, r *http.Request) {
+	lo, hi := 50*time.Millisecond, 1*time.Second
+	minD, maxD := r.URL.Query().Get("min"), r.URL.Query().Get("max")
+	if d, err := time.ParseDuration(minD); err == nil {
+		lo = d
+	} else if minD != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "%v: NewRequest err: %v\n", time.Now().Format(time.RFC3339), err)
+		http.Error(w, "Failed to parse min duration\n", http.StatusBadRequest)
+		return
+	}
+	if d, err := time.ParseDuration(maxD); err == nil {
+		hi = d
+	} else if maxD != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "%v: NewRequest err: %v\n", time.Now().Format(time.RFC3339), err)
+		http.Error(w, "Failed to parse max duration\n", http.StatusBadRequest)
+		return
+	}
+	sleepDuration := lo + time.Duration(rand.Int63n(int64(hi-lo+1)))
+	time.Sleep(sleepDuration)
+	_, _ = fmt.Fprintf(w, "Slept for %v\n", sleepDuration)
+}
+
+func proxy(service string, w http.ResponseWriter, r *http.Request, client *http.Client) {
+	req, err := http.NewRequest(r.Method, "http://"+service+"/", http.NoBody)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v: NewRequest err: %v\n", time.Now().Format(time.RFC3339), err)
+		http.Error(w, "Failed to create request\n", http.StatusInternalServerError)
+		return
+	}
+	req.URL.Path = r.URL.Path[1+len(service):]
+	req.URL.RawQuery = r.URL.RawQuery
+	resp, err := client.Do(req)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v: request to envoy failed: %v\n", time.Now().Format(time.RFC3339), err)
+		http.Error(w, "Request to envoy failed\n", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.WriteHeader(resp.StatusCode)
+	if _, err = io.Copy(w, resp.Body); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v: failed to copy response body: %v\n", time.Now().Format(time.RFC3339), err)
+		return
+	}
+}
+
+func ready(w http.ResponseWriter) {
+	if shutdownInitiated.Load() {
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		_, _ = w.Write([]byte("OK"))
+	}
+}
+
+func main() {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Tune the Transport to allow more concurrent connections.
+	// This is to exacerbate the problems we will demonstrate later.
+	transport.MaxIdleConns = 200
+	transport.MaxIdleConnsPerHost = 200
+	// Lower the client-side idle timeout from 90s to 4s to be
+	// compatible with all known servers, like:
+	// - Node.js with 5s (or 6s) timeout
+	// - Tomcat with 60s timeout
+	// - Jetty with 30s timeout
+	transport.IdleConnTimeout = 4 * time.Second
+	client := &http.Client{
+		Transport: transport,
+	}
+	server := &http.Server{
+		Addr: ":8080",
+	}
+	mux := http.NewServeMux()
+	server.Handler = mux
+
+	mux.Handle("/ready", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ready(w)
+	}))
+	mux.Handle("/sleep", graceful(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sleep(w, r)
+	})))
+	mux.Handle("/envoy/", graceful(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy("envoy", w, r, client)
+	})))
+	mux.Handle("/nginx/", graceful(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy("nginx", w, r, client)
+	})))
+	mux.Handle("/varnish/", graceful(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy("varnish", w, r, client)
+	})))
+	mux.Handle("/node-demo/", graceful(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy("java-demo", w, r, client)
+	})))
+	mux.Handle("/java-demo/", graceful(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy("java-demo", w, r, client)
+	})))
+
+	// set up signal handling for graceful shutdown
+	sigs := make(chan os.Signal, 1)
+	done := make(chan struct{}, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigs
+		_, _ = fmt.Printf("%v: received signal: %v\n", time.Now().Format(time.RFC3339), sig)
+		done <- struct{}{}
+	}()
+
+	// start server
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			_, _ = fmt.Fprintf(os.Stderr, "%v: server error: %v\n", time.Now().Format(time.RFC3339), err)
+		}
+	}()
+
+	// wait for signal to shutdown
+	<-done
+
+	shutdown(server)
+}
+
+func shutdown(server *http.Server) {
+	shutdownInitiated.Store(true)
+	if gracefulShutdown {
+		_, _ = fmt.Printf("%v: initiating graceful shutdown...\n", time.Now().Format(time.RFC3339))
+		// let all incoming requests know that shutdown is initiated by
+		// responding with "Connection: close" such that they don't attempt
+		// to reuse connections.
+		gracefulChan := make(chan struct{})
+		shutdownTimer = atomic.Pointer[time.Timer]{}
+		_, _ = fmt.Printf("%v: waiting for new requests on existing connections (%v)...\n", time.Now().Format(time.RFC3339), clientSideIdleTimeout)
+		shutdownTimer.Store(time.AfterFunc(clientSideIdleTimeout, func() {
+			_, _ = fmt.Printf("%v: graceful shutdown timeout reached, forcing exit\n", time.Now().Format(time.RFC3339))
+			close(gracefulChan)
+		}))
+		<-gracefulChan
+	} else {
+		_, _ = fmt.Printf("%v: waiting for %v before shutdown...\n", time.Now().Format(time.RFC3339), clientSideIdleTimeout)
+		time.Sleep(clientSideIdleTimeout)
+	}
+	_, _ = fmt.Printf("%v: shutting down server...\n", time.Now().Format(time.RFC3339))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v: server shutdown error: %v\n", time.Now().Format(time.RFC3339), err)
+	}
+	_, _ = fmt.Printf("%v: server exited properly\n", time.Now().Format(time.RFC3339))
+}
+
