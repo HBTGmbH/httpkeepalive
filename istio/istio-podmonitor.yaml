@@ -1,0 +1,26 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: istio-dataplane-podmonitor
+  namespace: monitoring
+spec:
+  selector:
+    matchExpressions:
+    - {key: istio-prometheus-ignore, operator: DoesNotExist}
+  namespaceSelector:
+    any: true
+  jobLabel: envoy-stats
+  podMetricsEndpoints:
+  - path: /stats/prometheus
+    params:
+      # Specify "usedonly" as query parameter.
+      # See: https://www.envoyproxy.io/docs/envoy/latest/operations/admin#get--stats-prometheus
+      # A value is actually not needed for Envoy (only the "usedonly" key)
+      # but works nonetheless. And I am not sure whether Prometheus accepts
+      # a params key without a value here, so we simply use the string "true".
+      usedonly: ["true"]
+    port: http-envoy-prom
+    relabelings:
+    - action: labeldrop
+      regex: "__meta_kubernetes_pod_label_(.+)"
+
