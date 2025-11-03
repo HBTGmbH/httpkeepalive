@@ -1,0 +1,21 @@
+controller:
+  replicaCount: 2
+  config:
+    keep-alive: "60"
+    keep-alive-requests: "60000"
+    upstream-keepalive-timeout: "4"
+    upstream-keepalive-requests: "60000"
+  startupProbe:
+    httpGet:
+      path: "/healthz"
+      port: 10254
+      scheme: HTTP
+    periodSeconds: 1
+    timeoutSeconds: 1
+    successThreshold: 1
+    failureThreshold: 60
+  livenessProbe:
+    initialDelaySeconds: 0
+  readinessProbe:
+    initialDelaySeconds: 0
+
